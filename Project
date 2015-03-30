@@ -1,0 +1,607 @@
+
+// Implement Histogram Filter 
+//P(rgb is skin)
+//P(rgb is !skin)
+//If above or below threshold theta, accept or reject image
+//test data was done for 0.4 threshold
+//do a conversion for 32 and 16 bin histogram's 
+
+
+//To do list
+//Implement Gaussian Filter
+//P(x) =  i=1 -> N summation for w[i] *Part1*Part2
+//Part1: (1 / ((2PI)^(3/2) * abs(covariance Matrix[i])^ (1/2) ) ) 
+//Part2: Eulers ^ ((-1/2)*(x-u[i])^T * Matrix[i]^-1 * (x-u[i])) 
+//w[i] = scalar weight
+//u[i] = mean vector
+//covariance matrix = diagonal covariance matrix
+//16 guassians were used for each skin and non skin classes
+//Will store mean covariance and weight in txt for skin and non-skin
+//first 16 entries being skin, remainder being non skin
+//What is T: Transpose
+
+#include <fstream>
+#include <iostream>
+#include <opencv/cv.h>
+#include <opencv2/highgui/highgui.hpp>
+#include <thread>
+#include <atomic>
+#include <system_error>
+
+
+using namespace std;
+using namespace cv;
+
+
+
+
+//************************************************************//
+//Global Variables
+//***********************************************************//
+
+atomic<int> Histogram[256][256][256][2];
+atomic<int> Histogram_32[32][32][32][2];
+atomic<int> Histogram_16[16][16][16][2];
+
+atomic<int> PIXELCOUNTER(0),SKINPIXELS(0),NSKINPIXELS(0);
+
+atomic<int> RGBSKIN(0),RGBNSKIN(0),RGBSHARED(0);
+atomic<int> RGBSKIN32(0),RGBNSKIN32(0),RGBSHARED32(0);
+atomic<int> RGBSKIN16(0),RGBNSKIN16(0),RGBSHARED16(0);
+
+const string DEST[3]{"./Images/output/Two/","./Images/output/Thirty/","./Images/output/Sixteen/"};
+
+double kernal[32], mu[32][3], covariance[32][3], weight[32];
+const string DESTGAUS {"./Images/output/Gaus/"};
+
+const double PI=3.1415926535;
+
+//************************************************************//
+//Function Proto
+//***********************************************************//
+void nonSkin();
+void putNonInHistogram(const Mat& image);
+void skin();
+void putSkinToHistogram(const Mat& skin, const Mat& mask);
+Mat calculateProbabilities(const Mat& image,const double& threshold,const int& bitNum=0);
+void fileOutResults();
+void buildOutputMask(const double& threshold,const int& argc,char** argv);
+
+void applyGaussian(const double& threshold, const int& argc,char** argv,const int& start,const int& stop);
+void grabTable();
+void getX(int& blue,int& green,int& red,const Mat& inimage,const int& c,const int& r);
+double part1(const int& i);
+double part2(const int* colorChannel,const int& i);
+
+
+
+//arg 1 will be the Threshold given
+// arg 2+ will be the Images
+int main(int argc, char** argv)
+{
+	string t = argv[1];
+	double threshold = stod(t);
+
+	int stop = (argc/4)+2;
+	int stop2 = (argc/2)+2;
+	int stop3 = (argc/4)*3 + 2;
+
+	cout<<"-------------------- PART 1/5 Threading the Forever Running Gaussian -----------"<<endl;
+	/*grabTable();
+	thread takesForever(applyGaussian,threshold,argc,argv,2,stop);
+	thread takesForeverTwo(applyGaussian,threshold,argc,argv,stop+1,stop2);
+*/
+
+	cout<<"-------------------- PART 2/5 Building Probability Histogram -------------------"<<endl;
+		//Run through each picture in the non-skin category.
+		//Will open up the txt file and then go to the directory of Images/non-skin-images
+
+	thread first(nonSkin);
+	thread second(skin);
+	first.join();
+	second.join();
+	
+
+	cout<<"TOTAL PIXEL COUNT: "<<PIXELCOUNTER<<endl;
+	cout<<"--------------------- PART 3/5 Running Probability on Image --------------------"<<endl;
+/*
+	thread takesForeverThree(applyGaussian,threshold,argc,argv,stop2+1,stop3);
+	thread takesForeverFour(applyGaussian,threshold,argc,argv,stop3+1,argc);
+*/	
+	buildOutputMask(threshold, argc, argv);
+
+
+	cout<<"--------------------- PART 4/5 Histogram Model Complete -----"<<endl;
+/*	
+	try
+	{
+		takesForever.join();
+		takesForeverTwo.join();
+		takesForeverThree.join();
+		takesForeverFour.join();
+	}
+	catch(const system_error& e)
+	{
+		cout << "Caught system_error with code " << e.code()<<" meaning "<<e.what()<<endl;
+    }
+	*/
+	cout<<"--------------------- PART 5/5 Guassian Finally Complete -----------------------"<<endl;
+	fileOutResults();
+	
+
+	return 0;
+}
+
+
+
+/******************************************************************/
+//grab image names from the non-skin-image text file, 
+//use names to open up picture file from the required directory
+//iterate every value in the picture and put an increment in each
+// bin in the histogram, all these pixel values will be put into bin r,g,b,[0]
+/*****************************************************************/
+void nonSkin()
+{
+	ifstream fin("non-skinNames.txt");
+	string fileName;
+	Mat image,image2;
+
+	while(!fin.eof())
+	{
+		fin>>fileName;
+
+
+		//ended up including the directories in the textfiles
+		while(fileName == "." || fileName == "..")
+			fin>>fileName;
+
+		fileName = "./Images/non-skin-images/" + fileName;
+		image = imread(fileName,1);
+
+		thread three(putNonInHistogram,image);
+		if(fin>>fileName)
+		{
+			fileName = "./Images/non-skin-images/" + fileName;
+			image2 = imread(fileName,1);
+			
+			thread fourth(putNonInHistogram,image2);
+			fourth.join();
+		}
+
+		three.join();
+		image.release();
+		image2.release();
+	}
+	cout<<"NON-SKIN COMPLETE"<<endl;
+
+}
+
+
+
+/***********************************************************************/
+//Will put the non skin pixels into the histogram
+//Note that openCv orders channels as BGR
+//**********************************************************************/
+void putNonInHistogram(const Mat& image)
+{
+	for(int i = 0;i<image.rows;i++)
+		for(int j=0;j<image.cols;j++)
+		{
+			int b = image.at<Vec3b>(i,j)[0];
+			int g = image.at<Vec3b>(i,j)[1];
+			int r = image.at<Vec3b>(i,j)[2];
+				
+			if(Histogram[b][g][r][0]++ == 0)
+			{
+				RGBNSKIN++;
+				if(Histogram[b][g][r][1] > 0)
+					RGBSHARED++;
+			}
+
+			int b32 = floor(b/32.0);
+			int g32 = floor(g/32.0);
+			int r32 = floor(r/32.0);
+			if(Histogram_32[b32][g32][r32][0]++ == 0)
+			{
+				RGBNSKIN32++;
+				if(Histogram_32[b32][g32][r32][1] > 0)
+					RGBSHARED32++;
+			}
+
+			int b16 = floor(b/16.0);
+			int g16 = floor(g/16.0);
+			int r16 = floor(r/16.0);
+			if(Histogram_16[b16][g16][r16][0]++ == 0)
+			{
+				RGBNSKIN16++;
+				if(Histogram_16[b16][g16][r16][1] > 0)
+					RGBSHARED16++;
+			}
+
+			PIXELCOUNTER++;
+			NSKINPIXELS++;
+		}
+} 
+
+
+
+/************************************************************************/
+//Image will run through each of the pixels in the skin image
+//At each pixel coordinate, it will reference the same coordinate in the mask
+// at the position in the mask it will have a value of either
+// 1 or 0, 1 referring that the pixel had been labelled as skin
+// it will increment the bin appropriate to skin/non-skin at the bgr from the skin image 
+/************************************************************************/
+void skin()
+{
+	ifstream fskin("skinNames.txt");
+	string skinName,maskName;
+	Mat skinImage,maskImage;
+
+//Need to ensure that I open an equivalent file name of fmask
+	while(!fskin.eof())
+	{
+		//Note that skin name and mask name do not appear in the same order in
+		//the text files
+		fskin>>skinName;
+		while(skinName == "." || skinName == "..")
+			fskin>>skinName;
+		maskName.assign(skinName);
+		maskName.replace(maskName.end()-3,maskName.end(),"pbm");
+		
+		//Directories end up getting inserted in the text names.	
+		skinName = "./Images/skin-images/" + skinName;
+		skinImage = imread(skinName,1);
+
+		maskName = "./Images/masks/" + maskName;
+		maskImage = imread(maskName,-1);
+
+		if(skinImage.data != NULL && maskImage.data != NULL)
+		putSkinToHistogram(skinImage,maskImage);
+		skinImage.release();
+		maskImage.release();
+
+	}
+	cout<<"SKIN COMPLETE"<<endl;
+}
+
+
+
+/*************************************************************************/
+//Function will iterate through the coordinates in both the skin and mask
+// images and put into the appropriate BGR bin a increment in the skin or nonSkin
+/*************************************************************************/
+void putSkinToHistogram(const Mat& skin, const Mat& mask)
+{
+	for(int i=0;i<skin.rows;i++)
+		for(int j=0;j<skin.cols;j++)
+		{
+			int b = skin.at<Vec3b>(i,j)[0];
+			int g = skin.at<Vec3b>(i,j)[1];
+			int r = skin.at<Vec3b>(i,j)[2];
+	
+			//image is a binary file, however black is represented as 0,
+			//WHite is represented as 255
+			int m=0;
+			if(mask.at<uchar>(i,j) > 0) 
+				{
+					SKINPIXELS++;
+					m=1;
+				}
+				else NSKINPIXELS++;
+
+				if(Histogram[b][g][r][m]++ == 0)
+				{
+					if(m==0)
+						RGBNSKIN++;
+					else
+						RGBSKIN++;
+					if(Histogram[b][g][r][(m+1)%2] > 0)
+						RGBSHARED++;	
+				}		
+
+				int b32 = floor(b/32.0);
+				int g32 = floor(g/32.0);
+				int r32 = floor(r/32.0);
+				if(Histogram_32[b32][g32][r32][m]++ == 0)
+				{
+					if(m==0)
+						RGBNSKIN32++;
+					else
+						RGBSKIN32++;
+					if(Histogram_32[b32][g32][r32][(m+1)%2] > 0)
+						RGBSHARED32++;
+				}
+
+				int b16 = floor(b/16.0);
+				int g16 = floor(g/16.0);
+				int r16 = floor(r/16.0);
+				if(Histogram_16[b16][g16][r16][m]++ == 0)
+				{
+					if(m==0)
+						RGBNSKIN16++;
+					else
+						RGBSKIN16++;
+					if(Histogram_16[b16][g16][r16][(m+1)%2] > 0)
+						RGBSHARED16++;
+				}
+
+			PIXELCOUNTER++;
+		}
+}
+
+
+
+/*************************************************************************/
+//for a 256 bit histogram will calculate the probability
+// that a pixel is skin based off the 
+//  counts in the skin and non-skin bins at [B][G][R] in the Histogram
+//will return a Mat Image that is filled with probablities <int> on scale of 0 - 1
+/*************************************************************************/
+Mat calculateProbabilities(const Mat& image,const double& threshold,const int& bitNum)
+{
+	
+	//Note that the probabilities have not been coming out to 
+	int rows=image.rows,cols=image.cols;
+	Mat pImage;
+	pImage.create(rows,cols,CV_8UC1);
+	//atomic<int>  ****hist[]{Histogram,Histogram_32,Histogram_16};	
+	double pSkin=0,pNSkin=0,probability=0;
+
+	for(int i=0; i<image.rows;i++)
+		for(int j=0; j<image.cols;j++)
+		{
+			int b = image.at<Vec3b>(i,j)[0];
+			int g = image.at<Vec3b>(i,j)[1];
+			int r = image.at<Vec3b>(i,j)[2];
+
+			switch(bitNum)
+			{
+				case 0:
+				{
+					pSkin = (Histogram[b][g][r][1]/(SKINPIXELS*1.0));
+					pNSkin = (Histogram[b][g][r][0]/(NSKINPIXELS*1.0));
+					break;
+				} 
+				case 1:
+				{
+					int b32 = round(b/32.0);
+					int g32 = round(g/32.0);
+					int r32 = round(r/32.0);
+					pSkin = (Histogram_32[b32][g32][r32][1]/(SKINPIXELS*1.0));
+					pNSkin = (Histogram_32[b32][g32][r32][0]/(NSKINPIXELS*1.0));
+					break;
+
+				}
+				case 2:
+				{
+					int b16 = round(b/16.0);
+					int g16 = round(g/16.0);
+					int r16 = round(r/16.0);
+					pSkin = (Histogram_16[b16][g16][r16][1]/(SKINPIXELS*1.0));
+					pNSkin = (Histogram_16[b16][g16][r16][0]/(NSKINPIXELS*1.0));
+					break;
+				}
+				default: {cout<<"ERROR HANDLING BITNUM LINE 364"<<endl;break;}
+			}
+	
+		//	pSkin = (hist[bitNum][b][g][r][1]/(SKINPIXELS*1.0));
+		//	pNSkin = (hist[bitNum][b][g][r][0]/(NSKINPIXELS*1.0));
+			probability = pSkin/pNSkin;
+
+			if(probability > 1)
+				probability =1;
+			if (probability >= threshold)
+				pImage.at<uchar>(i,j) = 255;
+			else
+				pImage.at<uchar>(i,j) = 0;
+		}
+	
+
+	return pImage;
+}
+
+
+/**********************************************************************/
+//Used for printing the data of building the histogram
+/**********************************************************************/
+void fileOutResults()
+{
+	ofstream fout ("TestResults.txt");
+	
+	fout<<"Pixels Learned as skin:    "<<SKINPIXELS<<endl;
+  	fout<<"Pixels Learned as nonSkin: "<<NSKINPIXELS<<endl;
+  	fout<<"Pixels to Learn Total:     "<<PIXELCOUNTER<<endl<<endl;
+
+  	fout<<"For 256^3 bins"<<endl;
+  	fout<<"Total RGB Bins used for skin:     "<<RGBSKIN<<endl;
+  	fout<<"Total RGB Bins used for Non-skin: "<<RGBNSKIN<<endl;
+  	fout<<"Total RGB Bins common skin&!skin: "<<RGBSHARED<<endl<<endl;
+  	
+  	fout<<"For 32^3 bins"<<endl;
+  	fout<<"Total RGB Bins used for skin:     "<<RGBSKIN32<<endl;
+  	fout<<"Total RGB Bins used for Non-skin: "<<RGBNSKIN32<<endl;
+  	fout<<"Total RGB Bins common skin&!skin: "<<RGBSHARED32<<endl<<endl;
+
+  	fout<<"For 16^3 bins"<<endl;
+  	fout<<"Total RGB Bins used for skin:     "<<RGBSKIN16<<endl;
+  	fout<<"Total RGB Bins used for Non-skin: "<<RGBNSKIN16<<endl;
+  	fout<<"Total RGB Bins common skin&!skin: "<<RGBSHARED16<<endl<<endl;
+}
+
+
+
+/**********************************************************************/
+//Will apply the histogram model to a output image, image will be 
+//Binary for skin or not skin, based off the threshold provided and
+// probabilities for the each value being skin or not
+/**********************************************************************/
+void buildOutputMask(const double& threshold, const int& argc,char** argv)
+{
+	//This portion will modify the argument image and output the detected skin of it.
+	for(int j=2; j<500;j++)
+	{
+		//256 bit, 32 bit, 16 bit images
+		string imageName[3] {argv[j],argv[j],argv[j]};
+		string iName[3];
+		Mat inimage; 
+		Mat pImage;
+
+		for(int i =0; i<3 ;i++)
+		{
+			iName[i] = imageName[i];
+
+			imageName[i].erase(imageName[i].end()-4,imageName[i].end());//Remove .jpg
+			//imageName[i] += ('_') + to_string(static_cast<int>(threshold*100));//Add threshold to end of name
+			
+
+			//Apply the bit of the image histogram applied
+			if(i == 0)
+				imageName[i] += "_256";
+			else if(i == 1)
+				imageName[i] += "_32";
+			else if(i == 2)
+				imageName[i] += "_16";
+
+			//Apply filetype
+			imageName[i] += ".pbm";
+			//Remove the previous destination name
+			if(imageName[i].find("non-skin-images") != string::npos)
+			imageName[i].erase(imageName[i].begin(),imageName[i].begin()+23);
+			else
+				imageName[i].erase(imageName[i].begin(),imageName[i].begin()+19);
+				
+				inimage = imread(iName[i], 1);
+				pImage = calculateProbabilities(inimage,threshold,i);
+				
+				imageName[i] = DEST[i] + imageName[i];//Put the appropriate destination on the 
+				
+				imwrite(imageName[i],pImage);
+				pImage.release();
+				inimage.release();
+
+		}	
+
+	}
+}
+
+
+
+/**********************************************************************/
+//Function will Apply a Gaussian Model on the image, the guassian Function
+// will return a P(x) being probability of the current pixel is skin or not
+
+//P(x) =  i=1 -> N summation for w[i] *Part1*Part2
+//Part1: (1 / ((2PI)^(3/2) * abs(covariance Matrix[i])^(1/2) ) ) 
+//Part2: Eulers ^ ((-1/2)*(x-u[i])^T * Matrix[i]^-1 * (x-u[i])) 
+
+//w[i] = scalar weight
+//x is a RGB value
+//u[i] = mean vector
+//N = number of Kernals
+//covariance matrix = diagonal covariance matrix
+//16 guassians were used for each skin and non skin classes
+//Will store mean covariance and weight in txt for skin and non-skin
+//first 16 entries being skin, remainder being non skin
+//What is T: Transpose
+//Provided Table is of form 16-skin 16 non-skin c 
+// kernal# mean[3] Covariance[3] weight 
+/**********************************************************************/
+void applyGaussian(const double& threshold, const int& argc,char** argv,const int& start,const int& stop)
+{
+	Mat inimage; 
+	Mat pImage;
+
+	for(int j=start;j<stop;j++)
+	{
+		cout<<"Guassian Current image : "<<j-1<<" of "<<stop-1<<endl;
+		string imageName{argv[j]};
+		Mat inimage = imread(imageName,1);
+		pImage.create(static_cast<int>(inimage.rows),static_cast<int>(inimage.cols),CV_8UC1);
+		int colorVect[3];
+		
+		for(int r=0;r<inimage.rows;r++)
+			for(int c=0;c<inimage.cols;c++)
+				{
+					double p=0,pskin=0,pnskin=0;
+					getX(colorVect[0],colorVect[1],colorVect[2],inimage,c,r);								
+						for(int i=0;i<16;i++)
+						{
+						// p += weight[i]*part1(i)*part2(colorVect,i);
+						 pskin += weight[i]*part1(i)*part2(colorVect,i);
+						 pnskin += weight[i+16]*part1(i+16)*part2(colorVect,i+16);
+						}
+
+					if (pskin/pnskin >= threshold)
+					{
+						//cout<<"P passed"<<endl;
+						pImage.at<uchar>(r,c) = 255;
+					}
+					else
+					pImage.at<uchar>(r,c) = 0;
+				}
+
+		string iName = imageName;
+
+		imageName.erase(imageName.end()-4,imageName.end());//Remove .jpg
+		imageName.erase(imageName.begin(),imageName.begin()+13);//Remove directory retrieved from
+		imageName = DESTGAUS + imageName + ('_') + to_string(static_cast<int>(threshold*100)) + "Gaus.pbm";
+		imwrite(imageName,pImage);
+		pImage.release();
+		inimage.release();
+	}
+}
+
+
+/**************************************************************************/
+//Will fill the Arrays with the values from the GaussianTable;
+/**************************************************************************/
+void grabTable()
+{
+	ifstream ftable("GaussianTable.txt");
+	for(int i =0; i<32;i++)	
+	{	
+		ftable>>kernal[i]>>mu[i][0]>>mu[i][1]>>mu[i][2]>>covariance[i][0]>>covariance[i][1]>>covariance[i][2]>>weight[i];
+	}	
+}
+
+
+
+/**************************************************************************/
+//Function is used to get the "vector" of BGR from the image at point
+// r,c
+/**************************************************************************/
+void getX(int& blue,int& green,int& red,const Mat& inimage,const int& c,const int& r)
+{
+	blue = inimage.at<Vec3b>(r,c)[0];
+	green = inimage.at<Vec3b>(r,c)[1];
+	red = inimage.at<Vec3b>(r,c)[2];
+}
+
+
+/**************************************************************************/
+//Calculate the first portion of Gaussian 
+//(1 / ((2PI)^(3/2) * abs(covariance Matrix[i])^(1/2) ) ) 
+/**************************************************************************/
+double part1(const int &i)
+{
+	double p1 = pow((2*PI),(3/2.0));
+	double p2 = pow(abs(covariance[i][0]*covariance[i][1]*covariance[i][2]),0.5);
+
+	return (1/(p1 * p2));
+}
+
+/**************************************************************************/
+//Part2: Eulers ^ ((-1/2)*(x-u[i])^T * covariance[i]^-1 * (x-u[i]))
+//where x is a BGR vector, i am handing in individual elements each function call
+/**************************************************************************/
+double part2(const int* colorChannel,const int& i)
+{
+	int upper=0;
+	for(int k=0;k<3;k++)
+	{
+		int color = colorChannel[k] - mu[i][k];
+		upper += ((1 / covariance[i][k]) * color*color);
+	}
+	return (exp(-0.5*upper));
+}
